@@ -37,14 +37,17 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def get_current_user(
-    request: Request,
+async def get_bearer_token(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-) -> User:
+) -> str:
     if credentials is None:
         raise UnauthorizedError("Missing bearer token.")
+    return credentials.credentials
+
+
+async def get_current_user(request: Request, token: str = Depends(get_bearer_token)) -> User:
     store = request.app.state.store
-    user = store.user_for_token(credentials.credentials)
+    user = store.user_for_token(token)
     if user is None:
         raise UnauthorizedError("Invalid or expired token.")
     return user
