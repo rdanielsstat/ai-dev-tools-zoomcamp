@@ -8,9 +8,12 @@ import hmac
 import os
 import secrets
 
-from fastapi import Depends, Request
+from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
+from .db.models import TokenModel, UserModel
+from .db.session import get_db
 from .errors import UnauthorizedError
 from .schemas import User
 
@@ -45,9 +48,11 @@ async def get_bearer_token(
     return credentials.credentials
 
 
-async def get_current_user(request: Request, token: str = Depends(get_bearer_token)) -> User:
-    store = request.app.state.store
-    user = store.user_for_token(token)
-    if user is None:
+async def get_current_user(db: Session = Depends(get_db), token: str = Depends(get_bearer_token)) -> User:
+    # Queries the DB directly (not via Store) to avoid a security<->store
+    # import cycle — Store already depends on hash_password/verify_password.
+    token_row = db.get(TokenModel, token)
+    user_row = db.get(UserModel, token_row.user_id) if token_row else None
+    if user_row is None:
         raise UnauthorizedError("Invalid or expired token.")
-    return user
+    return User(id=user_row.id, name=user_row.name, email=user_row.email, avatar_initials=user_row.avatar_initials)

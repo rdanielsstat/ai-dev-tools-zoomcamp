@@ -5,9 +5,11 @@ import { useEffect, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { Field, InkButton, Panel, QuietButton, TextInput } from "@/components/ledger";
 import { api } from "@/lib/api";
+import { requireAuth } from "@/lib/auth-guard";
 import { meQuery } from "@/lib/queries";
 
 export const Route = createFileRoute("/profile")({
+  beforeLoad: ({ context }) => requireAuth(context.queryClient),
   head: () => ({
     meta: [
       { title: "Your profile — Even" },

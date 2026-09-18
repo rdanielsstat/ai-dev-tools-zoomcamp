@@ -6,11 +6,13 @@ import { AppShell } from "@/components/AppShell";
 import { ExpenseForm, NewExpensePanel } from "@/components/NewExpensePanel";
 import { InkButton, Loading, Panel, QuietButton } from "@/components/ledger";
 import { api } from "@/lib/api";
+import { requireAuth } from "@/lib/auth-guard";
 import { activityQuery, balancesQuery, expensesQuery, groupQuery, meQuery } from "@/lib/queries";
 import { SPLIT_TYPES, formatCents, formatSigned } from "@/lib/money";
 import type { Expense, Group } from "@/lib/types";
 
 export const Route = createFileRoute("/groups/$groupId")({
+  beforeLoad: ({ context }) => requireAuth(context.queryClient),
   loader: async ({ params, context }) => {
     const group = await context.queryClient.ensureQueryData(groupQuery(params.groupId));
     if (!group) throw notFound();

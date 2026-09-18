@@ -1,14 +1,32 @@
-"""In-memory mock store standing in for the real database. Everything here
-disappears on restart — swap this module for a real ORM-backed repository
-later; routers only ever call methods on a Store instance, never touch
-internal state directly, so the swap shouldn't require router changes."""
+"""Business logic and persistence, backed by SQLAlchemy (see app/db/). This
+is the only module that touches the database — routers only ever call
+methods on a Store instance and only ever see the Pydantic schemas in
+app/schemas.py, never an ORM row, so the concrete database (currently SQLite,
+see app/db/session.py) can change without touching a single router."""
 
 from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
 
-from .errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError
+from fastapi import Depends
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from .db.models import (
+    ActivityEventModel,
+    ExpenseModel,
+    GroupModel,
+    ItemizedLineModel,
+    ItemizedLineParticipantModel,
+    MembershipModel,
+    PayerModel,
+    PaymentModel,
+    TokenModel,
+    UserModel,
+)
+from .errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError
 from .money import compute_split, simplify_debts
 from .schemas import (
     ActivityEvent,
@@ -16,14 +34,17 @@ from .schemas import (
     Expense,
     Group,
     GroupBalances,
+    ItemizedLine,
     Member,
     NewExpenseInput,
     NewPaymentInput,
+    Payer,
     Payment,
     Role,
     Transfer,
     User,
 )
+from .db.session import get_db
 from .security import hash_password, new_token, verify_password
 
 
@@ -35,150 +56,220 @@ def _today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def _user_schema(u: UserModel) -> User:
+    return User(id=u.id, name=u.name, email=u.email, avatar_initials=u.avatar_initials)
+
+
+def _group_schema(g: GroupModel) -> Group:
+    return Group(
+        id=g.id,
+        name=g.name,
+        description=g.description,
+        created_by=g.created_by,
+        created_at=g.created_at,
+        members=[
+            Member(
+                user_id=m.user_id,
+                name=m.user.name,
+                avatar_initials=m.user.avatar_initials,
+                role=m.role,
+                joined_at=m.joined_at,
+            )
+            for m in g.memberships
+        ],
+    )
+
+
+def _expense_schema(e: ExpenseModel) -> Expense:
+    return Expense(
+        id=e.id,
+        group_id=e.group_id,
+        description=e.description,
+        amount_cents=e.amount_cents,
+        date=e.date,
+        category=e.category,
+        split_type=e.split_type,
+        payers=[Payer(user_id=p.user_id, amount_cents=p.amount_cents) for p in e.payers],
+        shares=e.shares,
+        items=[
+            ItemizedLine(
+                id=item.id,
+                label=item.label,
+                amount_cents=item.amount_cents,
+                participant_ids=[pp.user_id for pp in item.participants],
+            )
+            for item in e.items
+        ]
+        or None,
+        split_values=e.split_values,
+        created_by=e.created_by,
+    )
+
+
+def _payment_schema(p: PaymentModel) -> Payment:
+    return Payment(
+        id=p.id,
+        group_id=p.group_id,
+        from_user_id=p.from_user_id,
+        to_user_id=p.to_user_id,
+        amount_cents=p.amount_cents,
+        date=p.date,
+        note=p.note,
+    )
+
+
+def _activity_schema(a: ActivityEventModel) -> ActivityEvent:
+    return ActivityEvent(
+        id=a.id,
+        group_id=a.group_id,
+        kind=a.kind,
+        actor_user_id=a.actor_user_id,
+        summary=a.summary,
+        amount_cents=a.amount_cents,
+        at=a.at,
+    )
+
+
 class Store:
-    def __init__(self) -> None:
-        self.users: dict[str, User] = {}
-        self._password_hashes: dict[str, str] = {}
-        self.tokens: dict[str, str] = {}  # token -> user_id
-        self.groups: dict[str, Group] = {}
-        self.expenses: dict[str, Expense] = {}
-        self.payments: dict[str, Payment] = {}
-        self.activity: list[ActivityEvent] = []
+    def __init__(self, db: Session) -> None:
+        self.db = db
 
     # ---- auth ---------------------------------------------------------
 
     def sign_up(self, name: str, email: str, password: str) -> tuple[User, str]:
         email_lower = email.strip().lower()
-        if any(u.email.lower() == email_lower for u in self.users.values()):
+        existing = self.db.execute(
+            select(UserModel).where(func.lower(UserModel.email) == email_lower)
+        ).scalar_one_or_none()
+        if existing is not None:
             raise ConflictError("An account with this email already exists.")
+
         initials = "".join(p[0] for p in name.split() if p)[:2].upper() or "EV"
-        user = User(id=_new_id("u"), name=name, email=email, avatar_initials=initials)
-        self.users[user.id] = user
-        self._password_hashes[user.id] = hash_password(password)
+        user = UserModel(
+            id=_new_id("u"), name=name, email=email, avatar_initials=initials, password_hash=hash_password(password)
+        )
+        self.db.add(user)
+        self.db.flush()  # tokens.user_id FKs to users.id; no relationship links them, so flush first
         token = new_token()
-        self.tokens[token] = user.id
-        return user, token
+        self.db.add(TokenModel(token=token, user_id=user.id, created_at=datetime.now(timezone.utc)))
+        self.db.commit()
+        return _user_schema(user), token
 
     def log_in(self, email: str, password: str) -> tuple[User, str]:
         email_lower = email.strip().lower()
-        user = next((u for u in self.users.values() if u.email.lower() == email_lower), None)
-        if user is None or not verify_password(password, self._password_hashes[user.id]):
-            from .errors import UnauthorizedError
-
+        user = self.db.execute(
+            select(UserModel).where(func.lower(UserModel.email) == email_lower)
+        ).scalar_one_or_none()
+        if user is None or not verify_password(password, user.password_hash):
             raise UnauthorizedError("Invalid email or password.")
+
         token = new_token()
-        self.tokens[token] = user.id
-        return user, token
+        self.db.add(TokenModel(token=token, user_id=user.id, created_at=datetime.now(timezone.utc)))
+        self.db.commit()
+        return _user_schema(user), token
 
     def log_out(self, token: str) -> None:
-        self.tokens.pop(token, None)
-
-    def user_for_token(self, token: str) -> User | None:
-        user_id = self.tokens.get(token)
-        return self.users.get(user_id) if user_id else None
+        self.db.execute(sa_delete(TokenModel).where(TokenModel.token == token))
+        self.db.commit()
 
     def update_profile(self, user_id: str, name: str | None, email: str | None) -> User:
-        user = self.users[user_id]
+        user = self.db.get(UserModel, user_id)
+        if user is None:
+            raise NotFoundError("User not found.")
+
         if email is not None:
             email_lower = email.strip().lower()
-            taken = any(
-                uid != user_id and u.email.lower() == email_lower for uid, u in self.users.items()
-            )
-            if taken:
+            taken = self.db.execute(
+                select(UserModel).where(func.lower(UserModel.email) == email_lower, UserModel.id != user_id)
+            ).scalar_one_or_none()
+            if taken is not None:
                 raise ConflictError("This email is already in use by another account.")
-        updated = user.model_copy(
-            update={"name": name if name is not None else user.name, "email": email or user.email}
-        )
-        self.users[user_id] = updated
-        return updated
+            user.email = email
+        if name is not None:
+            user.name = name
+
+        self.db.commit()
+        return _user_schema(user)
 
     # ---- groups ---------------------------------------------------------
 
-    def groups_for_user(self, user_id: str) -> list[Group]:
-        return [g for g in self.groups.values() if any(m.user_id == user_id for m in g.members)]
-
-    def get_group(self, group_id: str) -> Group | None:
-        return self.groups.get(group_id)
-
-    def require_membership(self, group_id: str, user_id: str) -> Group:
-        group = self.groups.get(group_id)
-        if group is None or not any(m.user_id == user_id for m in group.members):
+    def _group_orm_or_404(self, group_id: str, user_id: str) -> GroupModel:
+        group = self.db.get(GroupModel, group_id)
+        if group is None or not any(m.user_id == user_id for m in group.memberships):
             raise NotFoundError("Group not found.")
         return group
 
+    def groups_for_user(self, user_id: str) -> list[Group]:
+        stmt = select(GroupModel).join(MembershipModel).where(MembershipModel.user_id == user_id)
+        groups = self.db.execute(stmt).scalars().unique().all()
+        return [_group_schema(g) for g in groups]
+
+    def get_group(self, group_id: str) -> Group | None:
+        group = self.db.get(GroupModel, group_id)
+        return _group_schema(group) if group else None
+
+    def require_membership(self, group_id: str, user_id: str) -> Group:
+        return _group_schema(self._group_orm_or_404(group_id, user_id))
+
     def create_group(self, user_id: str, name: str, description: str) -> Group:
-        user = self.users[user_id]
-        group = Group(
-            id=_new_id("g"),
-            name=name,
-            description=description,
-            created_by=user_id,
-            created_at=_today(),
-            members=[Member(user_id=user_id, name=user.name, avatar_initials=user.avatar_initials, role=Role.admin, joined_at=_today())],
-        )
-        self.groups[group.id] = group
+        group = GroupModel(id=_new_id("g"), name=name, description=description, created_by=user_id, created_at=_today())
+        group.memberships.append(MembershipModel(user_id=user_id, role=Role.admin, joined_at=_today()))
+        self.db.add(group)
+        self.db.flush()  # activity_events.group_id FKs to groups.id; no relationship links them
         self._log(group.id, ActivityKind.group_created, user_id, f"created {name}")
-        return group
+        self.db.commit()
+        return _group_schema(group)
 
     def rename_group(self, group_id: str, user_id: str, name: str) -> Group:
-        group = self.require_membership(group_id, user_id)
+        group = self._group_orm_or_404(group_id, user_id)
         self._require_admin(group, user_id)
-        updated = group.model_copy(update={"name": name})
-        self.groups[group_id] = updated
-        return updated
+        group.name = name
+        self.db.commit()
+        return _group_schema(group)
 
     def add_member(self, group_id: str, user_id: str, email: str) -> Group:
-        group = self.require_membership(group_id, user_id)
+        group = self._group_orm_or_404(group_id, user_id)
         email_lower = email.strip().lower()
-        member_user = next((u for u in self.users.values() if u.email.lower() == email_lower), None)
+        member_user = self.db.execute(
+            select(UserModel).where(func.lower(UserModel.email) == email_lower)
+        ).scalar_one_or_none()
         if member_user is None:
             handle = email.split("@")[0] or "guest"
-            member_user = User(
+            member_user = UserModel(
                 id=_new_id("u"),
                 name=handle[:1].upper() + handle[1:],
                 email=email,
                 avatar_initials=handle[:2].upper(),
+                password_hash=hash_password(new_token()),
             )
-            self.users[member_user.id] = member_user
-            self._password_hashes[member_user.id] = hash_password(new_token())
+            self.db.add(member_user)
+            self.db.flush()
 
-        if not any(m.user_id == member_user.id for m in group.members):
-            new_members = [
-                *group.members,
-                Member(
-                    user_id=member_user.id,
-                    name=member_user.name,
-                    avatar_initials=member_user.avatar_initials,
-                    role=Role.member,
-                    joined_at=_today(),
-                ),
-            ]
-            group = group.model_copy(update={"members": new_members})
-            self.groups[group_id] = group
-            self._log(group_id, ActivityKind.member_joined, member_user.id, "joined the group")
-        return group
+        if not any(m.user_id == member_user.id for m in group.memberships):
+            group.memberships.append(MembershipModel(user_id=member_user.id, role=Role.member, joined_at=_today()))
+            self._log(group.id, ActivityKind.member_joined, member_user.id, "joined the group")
+
+        self.db.commit()
+        return _group_schema(group)
 
     def leave_group(self, group_id: str, user_id: str) -> None:
-        group = self.require_membership(group_id, user_id)
+        group = self._group_orm_or_404(group_id, user_id)
         net = self.get_balances(group_id, user_id).net.get(user_id, 0)
         if net != 0:
             raise BadRequestError("Settle up before leaving this group.")
-        remaining = [m for m in group.members if m.user_id != user_id]
-        self.groups[group_id] = group.model_copy(update={"members": remaining})
+        membership = next(m for m in group.memberships if m.user_id == user_id)
+        group.memberships.remove(membership)
         self._log(group_id, ActivityKind.member_left, user_id, "left the group")
+        self.db.commit()
 
     def delete_group(self, group_id: str, user_id: str) -> None:
-        group = self.require_membership(group_id, user_id)
+        group = self._group_orm_or_404(group_id, user_id)
         self._require_admin(group, user_id)
-        del self.groups[group_id]
-        for expense_id in [e.id for e in self.expenses.values() if e.group_id == group_id]:
-            del self.expenses[expense_id]
-        for payment_id in [p.id for p in self.payments.values() if p.group_id == group_id]:
-            del self.payments[payment_id]
-        self.activity = [a for a in self.activity if a.group_id != group_id]
+        self.db.delete(group)
+        self.db.commit()
 
-    def _require_admin(self, group: Group, user_id: str) -> None:
-        member = next((m for m in group.members if m.user_id == user_id), None)
+    def _require_admin(self, group: GroupModel, user_id: str) -> None:
+        member = next((m for m in group.memberships if m.user_id == user_id), None)
         if member is None or member.role != Role.admin:
             raise ForbiddenError("Only an admin can perform this action.")
 
@@ -194,21 +285,26 @@ class Store:
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> list[Expense]:
-        self.require_membership(group_id, user_id)
-        items = [e for e in self.expenses.values() if e.group_id == group_id]
-        if member_id:
-            items = [
-                e for e in items if any(p.user_id == member_id for p in e.payers) or member_id in e.shares
-            ]
+        self._group_orm_or_404(group_id, user_id)
+        stmt = select(ExpenseModel).where(ExpenseModel.group_id == group_id)
         if category:
-            items = [e for e in items if e.category == category]
+            stmt = stmt.where(ExpenseModel.category == category)
         if date_from:
-            items = [e for e in items if e.date >= date_from]
+            stmt = stmt.where(ExpenseModel.date >= date_from)
         if date_to:
-            items = [e for e in items if e.date <= date_to]
-        return sorted(items, key=lambda e: e.date, reverse=True)
+            stmt = stmt.where(ExpenseModel.date <= date_to)
+        rows = list(self.db.execute(stmt).scalars().all())
 
-    def _build_expense(self, expense_id: str, input: NewExpenseInput, created_by: str) -> Expense:
+        # Membership filtering reaches into the `shares` JSON map — keeping
+        # it in Python avoids relying on JSON query support that differs a
+        # lot between SQLite, Postgres, and MySQL.
+        if member_id:
+            rows = [e for e in rows if any(p.user_id == member_id for p in e.payers) or member_id in e.shares]
+
+        rows.sort(key=lambda e: e.date, reverse=True)
+        return [_expense_schema(e) for e in rows]
+
+    def _apply_expense_fields(self, expense: ExpenseModel, input: NewExpenseInput) -> None:
         payers_total = sum(p.amount_cents for p in input.payers)
         if not input.payers or payers_total != input.amount_cents:
             raise BadRequestError(f"Payers must add up to the total amount ({input.amount_cents} cents).")
@@ -224,51 +320,60 @@ class Store:
         if error:
             raise BadRequestError(error)
 
-        return Expense(
-            id=expense_id,
-            group_id=input.group_id,
-            description=input.description,
-            amount_cents=input.amount_cents,
-            date=input.date,
-            category=input.category,
-            split_type=input.split_type,
-            payers=input.payers,
-            shares=shares,
-            items=input.items,
-            split_values=input.values,
-            created_by=created_by,
-        )
+        expense.group_id = input.group_id
+        expense.description = input.description
+        expense.amount_cents = input.amount_cents
+        expense.date = input.date
+        expense.category = input.category
+        expense.split_type = input.split_type
+        expense.shares = shares
+        expense.split_values = input.values
+        # Reassigning these relationships lets delete-orphan cascade clean up
+        # whatever was there before (relevant on edit; a no-op on create).
+        expense.payers = [PayerModel(user_id=p.user_id, amount_cents=p.amount_cents) for p in input.payers]
+        expense.items = [
+            ItemizedLineModel(
+                id=item.id,
+                label=item.label,
+                amount_cents=item.amount_cents,
+                participants=[ItemizedLineParticipantModel(user_id=uid) for uid in item.participant_ids],
+            )
+            for item in (input.items or [])
+        ]
 
     def add_expense(self, group_id: str, user_id: str, input: NewExpenseInput) -> Expense:
-        self.require_membership(group_id, user_id)
-        expense = self._build_expense(_new_id("e"), input, user_id)
-        self.expenses[expense.id] = expense
+        self._group_orm_or_404(group_id, user_id)
+        expense = ExpenseModel(id=_new_id("e"), created_by=user_id)
+        self._apply_expense_fields(expense, input)
+        self.db.add(expense)
         self._log(group_id, ActivityKind.expense_added, user_id, f"added {expense.description}", expense.amount_cents)
-        return expense
+        self.db.commit()
+        return _expense_schema(expense)
 
     def edit_expense(self, expense_id: str, user_id: str, input: NewExpenseInput) -> Expense:
-        existing = self.expenses.get(expense_id)
-        if existing is None:
+        expense = self.db.get(ExpenseModel, expense_id)
+        if expense is None:
             raise NotFoundError("Expense not found.")
-        self.require_membership(existing.group_id, user_id)
-        updated = self._build_expense(expense_id, input, existing.created_by)
-        self.expenses[expense_id] = updated
-        self._log(updated.group_id, ActivityKind.expense_edited, user_id, f"edited {updated.description}", updated.amount_cents)
-        return updated
+        self._group_orm_or_404(expense.group_id, user_id)
+        self._apply_expense_fields(expense, input)
+        self._log(expense.group_id, ActivityKind.expense_edited, user_id, f"edited {expense.description}", expense.amount_cents)
+        self.db.commit()
+        return _expense_schema(expense)
 
     def delete_expense(self, expense_id: str, user_id: str) -> None:
-        existing = self.expenses.get(expense_id)
-        if existing is None:
+        expense = self.db.get(ExpenseModel, expense_id)
+        if expense is None:
             raise NotFoundError("Expense not found.")
-        self.require_membership(existing.group_id, user_id)
-        del self.expenses[expense_id]
-        self._log(existing.group_id, ActivityKind.expense_deleted, user_id, f"deleted {existing.description}", existing.amount_cents)
+        self._group_orm_or_404(expense.group_id, user_id)
+        self._log(expense.group_id, ActivityKind.expense_deleted, user_id, f"deleted {expense.description}", expense.amount_cents)
+        self.db.delete(expense)
+        self.db.commit()
 
     # ---- balances, payments, settlement ------------------------------------
 
     def get_balances(self, group_id: str, user_id: str) -> GroupBalances:
-        group = self.require_membership(group_id, user_id)
-        net: dict[str, int] = {m.user_id: 0 for m in group.members}
+        group = self._group_orm_or_404(group_id, user_id)
+        net: dict[str, int] = {m.user_id: 0 for m in group.memberships}
         pair: dict[str, int] = {}
 
         def bump(frm: str, to: str, cents: int) -> None:
@@ -278,9 +383,8 @@ class Store:
             sign = 1 if frm < to else -1
             pair[key] = pair.get(key, 0) + sign * cents
 
-        for expense in self.expenses.values():
-            if expense.group_id != group_id:
-                continue
+        expenses = self.db.execute(select(ExpenseModel).where(ExpenseModel.group_id == group_id)).scalars().all()
+        for expense in expenses:
             for payer in expense.payers:
                 net[payer.user_id] = net.get(payer.user_id, 0) + payer.amount_cents
             for uid, cents in expense.shares.items():
@@ -289,9 +393,8 @@ class Store:
                     portion = round(cents * payer.amount_cents / expense.amount_cents)
                     bump(uid, payer.user_id, portion)
 
-        for payment in self.payments.values():
-            if payment.group_id != group_id:
-                continue
+        payments = self.db.execute(select(PaymentModel).where(PaymentModel.group_id == group_id)).scalars().all()
+        for payment in payments:
             net[payment.from_user_id] = net.get(payment.from_user_id, 0) + payment.amount_cents
             net[payment.to_user_id] = net.get(payment.to_user_id, 0) - payment.amount_cents
             bump(payment.to_user_id, payment.from_user_id, payment.amount_cents)
@@ -310,31 +413,40 @@ class Store:
         return GroupBalances(net=net, pairwise=pairwise, settlement=simplify_debts(net))
 
     def list_payments(self, group_id: str, user_id: str) -> list[Payment]:
-        self.require_membership(group_id, user_id)
-        return [p for p in self.payments.values() if p.group_id == group_id]
+        self._group_orm_or_404(group_id, user_id)
+        rows = self.db.execute(select(PaymentModel).where(PaymentModel.group_id == group_id)).scalars().all()
+        return [_payment_schema(p) for p in rows]
 
     def record_payment(self, group_id: str, user_id: str, input: NewPaymentInput) -> Payment:
-        self.require_membership(group_id, user_id)
-        payment = Payment(id=_new_id("p"), **input.model_dump(exclude={"group_id"}), group_id=group_id)
-        self.payments[payment.id] = payment
-        to_user = self.users.get(input.to_user_id)
+        self._group_orm_or_404(group_id, user_id)
+        payment = PaymentModel(
+            id=_new_id("p"),
+            group_id=group_id,
+            from_user_id=input.from_user_id,
+            to_user_id=input.to_user_id,
+            amount_cents=input.amount_cents,
+            date=input.date,
+            note=input.note,
+        )
+        self.db.add(payment)
+        to_user = self.db.get(UserModel, input.to_user_id)
         to_name = to_user.name.split()[0] if to_user else "member"
         self._log(group_id, ActivityKind.payment_recorded, input.from_user_id, f"recorded a payment to {to_name}", payment.amount_cents)
-        return payment
+        self.db.commit()
+        return _payment_schema(payment)
 
     # ---- activity ---------------------------------------------------------
 
     def list_activity(self, group_id: str, user_id: str) -> list[ActivityEvent]:
-        self.require_membership(group_id, user_id)
-        return sorted(
-            (a for a in self.activity if a.group_id == group_id),
-            key=lambda a: a.at,
-            reverse=True,
-        )
+        self._group_orm_or_404(group_id, user_id)
+        rows = self.db.execute(
+            select(ActivityEventModel).where(ActivityEventModel.group_id == group_id).order_by(ActivityEventModel.at.desc())
+        ).scalars().all()
+        return [_activity_schema(a) for a in rows]
 
     def _log(self, group_id: str, kind: ActivityKind, actor_user_id: str, summary: str, amount_cents: int | None = None) -> None:
-        self.activity.append(
-            ActivityEvent(
+        self.db.add(
+            ActivityEventModel(
                 id=_new_id("a"),
                 group_id=group_id,
                 kind=kind,
@@ -344,3 +456,7 @@ class Store:
                 at=datetime.now(timezone.utc),
             )
         )
+
+
+def get_store(db: Session = Depends(get_db)) -> Store:
+    return Store(db)

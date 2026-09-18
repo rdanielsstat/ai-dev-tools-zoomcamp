@@ -5,8 +5,10 @@ import { useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { Field, InkButton, Panel, TextInput } from "@/components/ledger";
 import { api } from "@/lib/api";
+import { requireAuth } from "@/lib/auth-guard";
 
 export const Route = createFileRoute("/groups/new")({
+  beforeLoad: ({ context }) => requireAuth(context.queryClient),
   head: () => ({
     meta: [
       { title: "New group — Even" },

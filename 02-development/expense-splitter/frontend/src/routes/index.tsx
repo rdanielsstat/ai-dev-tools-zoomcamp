@@ -3,10 +3,12 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 
 import { AppShell } from "@/components/AppShell";
 import { Panel } from "@/components/ledger";
+import { requireAuth } from "@/lib/auth-guard";
 import { balancesQuery, groupsQuery, meQuery } from "@/lib/queries";
 import { formatCents, formatSigned } from "@/lib/money";
 
 export const Route = createFileRoute("/")({
+  beforeLoad: ({ context }) => requireAuth(context.queryClient),
   head: () => ({
     meta: [
       { title: "Your groups — Even" },

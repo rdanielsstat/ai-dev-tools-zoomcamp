@@ -28,6 +28,11 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 
+# SQLite dev database (backend/app/db/session.py defaults to a local file)
+*.db
+*.db-journal
+*.sqlite3
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

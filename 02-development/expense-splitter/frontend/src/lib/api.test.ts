@@ -1,146 +1,177 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { api } from "./api";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiError, api } from "./api";
 
-// `api` is the ONLY module the UI is allowed to call (see api.ts). These
-// tests exercise it the way the UI does — through its public async surface —
-// as a stand-in for API endpoint tests until a real REST backend exists.
+// `api` now talks to the real FastAPI backend over HTTP (see ../../../openapi.yaml
+// and ../../../backend). Endpoint behavior itself is covered by the backend's
+// own pytest suite; these tests cover this module's HTTP plumbing — request
+// shape, auth header/token handling, and error mapping — against a mocked
+// fetch, so they run fast with no server needed.
 
-beforeEach(async () => {
-  await api.signIn("mara@even.app", "unused");
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(body === undefined ? null : JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+const fetchMock = vi.fn<typeof fetch>();
+
+/** Node has no DOM, so stub the bits of localStorage api.ts relies on. */
+function createMemoryStorage(): Storage {
+  const data = new Map<string, string>();
+  return {
+    getItem: (key) => data.get(key) ?? null,
+    setItem: (key, value) => void data.set(key, value),
+    removeItem: (key) => void data.delete(key),
+    clear: () => data.clear(),
+    key: (index) => Array.from(data.keys())[index] ?? null,
+    get length() {
+      return data.size;
+    },
+  };
+}
+
+let localStorage: Storage;
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", fetchMock);
+  localStorage = createMemoryStorage();
+  vi.stubGlobal("localStorage", localStorage);
+  fetchMock.mockReset();
 });
 
-describe("auth surface", () => {
-  it("getCurrentUser reflects the signed-in user", async () => {
-    const me = await api.getCurrentUser();
-    expect(me?.email).toBe("mara@even.app");
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("request URL and headers", () => {
+  it("hits the configured API base URL with a JSON content type", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, []));
+    await api.listGroups();
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe("http://localhost:8000/api/groups");
+    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
   });
 
-  it("signOut clears the session", async () => {
-    await api.signOut();
-    expect(await api.getCurrentUser()).toBeNull();
+  it("omits the Authorization header when signed out", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, []));
+    await api.listGroups();
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect((init!.headers as Record<string, string>)["Authorization"]).toBeUndefined();
+  });
+
+  it("attaches the bearer token after signing in", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        token: "tok_123",
+        user: { id: "u1", name: "Mara", email: "mara@even.app", avatarInitials: "MA" },
+      }),
+    );
+    await api.signIn("mara@even.app", "hunter22");
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, []));
+    await api.listGroups();
+    const [, init] = fetchMock.mock.calls[1]!;
+    expect((init!.headers as Record<string, string>)["Authorization"]).toBe("Bearer tok_123");
   });
 });
 
-describe("groups + expenses surface", () => {
-  it("creates a group, adds an expense, and reflects it in balances", async () => {
-    const group = await api.createGroup("Road trip", "");
-    await api.addMember(group.id, "theo@even.app");
-    await api.addExpense({
-      groupId: group.id,
-      description: "Gas",
-      amountCents: 6000,
-      date: "2026-02-01",
-      category: "Transit",
-      splitType: "equal",
-      payers: [{ userId: "u_mara", amountCents: 6000 }],
-      participantIds: ["u_mara", "u_theo"],
-    });
-
-    const expenses = await api.listExpenses(group.id);
-    expect(expenses).toHaveLength(1);
-
-    const balances = await api.getBalances(group.id);
-    expect(balances.net["u_mara"]).toBe(3000);
-    expect(balances.settlement).toEqual([
-      { fromUserId: "u_theo", toUserId: "u_mara", amountCents: 3000 },
-    ]);
+describe("auth flows", () => {
+  it("signUp stores the returned token and returns the user", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(201, {
+        token: "tok_abc",
+        user: { id: "u1", name: "Mara", email: "mara@even.app", avatarInitials: "MA" },
+      }),
+    );
+    const user = await api.signUp("Mara", "mara@even.app", "hunter22");
+    expect(user.email).toBe("mara@even.app");
+    expect(localStorage.getItem("even.token")).toBe("tok_abc");
   });
 
-  it("editExpense and deleteExpense round-trip through the service layer", async () => {
-    const group = await api.createGroup("Edits", "");
-    const expense = await api.addExpense({
-      groupId: group.id,
-      description: "Original",
-      amountCents: 1000,
-      date: "2026-02-01",
-      category: null,
-      splitType: "equal",
-      payers: [{ userId: "u_mara", amountCents: 1000 }],
-      participantIds: ["u_mara"],
-    });
-
-    const edited = await api.editExpense(expense.id, {
-      groupId: group.id,
-      description: "Updated",
-      amountCents: 1500,
-      date: "2026-02-02",
-      category: null,
-      splitType: "equal",
-      payers: [{ userId: "u_mara", amountCents: 1500 }],
-      participantIds: ["u_mara"],
-    });
-    expect(edited.description).toBe("Updated");
-
-    await api.deleteExpense(expense.id);
-    expect(await api.listExpenses(group.id)).toHaveLength(0);
+  it("getCurrentUser returns null without a stored token, making no request", async () => {
+    const user = await api.getCurrentUser();
+    expect(user).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("markPaid via recordPayment clears a suggested settlement", async () => {
-    const group = await api.createGroup("Settle via API", "");
-    await api.addMember(group.id, "theo@even.app");
-    await api.addExpense({
-      groupId: group.id,
-      description: "Hotel",
-      amountCents: 2000,
-      date: "2026-02-01",
-      category: null,
-      splitType: "equal",
-      payers: [{ userId: "u_mara", amountCents: 2000 }],
-      participantIds: ["u_mara", "u_theo"],
-    });
-
-    const before = await api.getBalances(group.id);
-    const [payment] = before.settlement;
-    await api.recordPayment({
-      groupId: group.id,
-      fromUserId: payment!.fromUserId,
-      toUserId: payment!.toUserId,
-      amountCents: payment!.amountCents,
-      date: "2026-02-03",
-    });
-
-    const after = await api.getBalances(group.id);
-    expect(after.settlement).toEqual([]);
-    const activity = await api.listActivity(group.id);
-    expect(activity[0]?.kind).toBe("payment_recorded");
+  it("getCurrentUser clears the token and returns null on a 401", async () => {
+    localStorage.setItem("even.token", "stale-token");
+    fetchMock.mockResolvedValue(jsonResponse(401, { detail: "Invalid or expired token." }));
+    const user = await api.getCurrentUser();
+    expect(user).toBeNull();
+    expect(localStorage.getItem("even.token")).toBeNull();
   });
 
-  it("leaveGroup rejects a non-zero balance and resolves once settled", async () => {
-    const group = await api.createGroup("Leave via API", "");
-    await api.addMember(group.id, "theo@even.app");
-    await api.addExpense({
-      groupId: group.id,
-      description: "Split",
-      amountCents: 1000,
-      date: "2026-02-01",
-      category: null,
-      splitType: "equal",
-      payers: [{ userId: "u_mara", amountCents: 1000 }],
-      participantIds: ["u_mara", "u_theo"],
-    });
+  it("signOut clears the token even if the request fails", async () => {
+    localStorage.setItem("even.token", "tok_1");
+    fetchMock.mockResolvedValue(jsonResponse(500, { detail: "boom" }));
+    await expect(api.signOut()).rejects.toThrow();
+    expect(localStorage.getItem("even.token")).toBeNull();
+  });
+});
 
-    await api.signIn("theo@even.app", "unused");
-    await expect(api.leaveGroup(group.id)).rejects.toThrow(/settle up/i);
+describe("error mapping", () => {
+  it("surfaces the backend's detail message", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(400, { detail: "Settle up before leaving this group." }),
+    );
+    await expect(api.leaveGroup("g1")).rejects.toThrow("Settle up before leaving this group.");
+  });
 
-    await api.recordPayment({
-      groupId: group.id,
-      fromUserId: "u_theo",
-      toUserId: "u_mara",
+  it("throws an ApiError carrying the status code", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(403, { detail: "Only an admin can perform this action." }),
+    );
+    await expect(api.deleteGroup("g1")).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it("getGroup maps a 404 to null instead of throwing", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(404, { detail: "Group not found." }));
+    expect(await api.getGroup("nope")).toBeNull();
+  });
+
+  it("reports a clear error when the server is unreachable", async () => {
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    await expect(api.listGroups()).rejects.toThrow(/reach the server/i);
+  });
+
+  it("treats a 204 response as a void success", async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+    await expect(api.leaveGroup("g1")).resolves.toBeUndefined();
+  });
+});
+
+describe("request bodies", () => {
+  it("addExpense posts to the group's expenses endpoint with the input as the body", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(201, {
+        id: "e1",
+        groupId: "g1",
+        description: "Coffee",
+        amountCents: 500,
+        date: "2026-01-01",
+        category: null,
+        splitType: "equal",
+        payers: [{ userId: "u1", amountCents: 500 }],
+        shares: { u1: 500 },
+        createdBy: "u1",
+      }),
+    );
+    const input = {
+      groupId: "g1",
+      description: "Coffee",
       amountCents: 500,
-      date: "2026-02-02",
-    });
-    await expect(api.leaveGroup(group.id)).resolves.toBeUndefined();
-  });
-
-  it("deleteGroup requires admin", async () => {
-    const group = await api.createGroup("Delete via API", "");
-    await api.addMember(group.id, "theo@even.app");
-
-    await api.signIn("theo@even.app", "unused");
-    await expect(api.deleteGroup(group.id)).rejects.toThrow(/admin/i);
-
-    await api.signIn("mara@even.app", "unused");
-    await expect(api.deleteGroup(group.id)).resolves.toBeUndefined();
-    expect(await api.getGroup(group.id)).toBeNull();
+      date: "2026-01-01",
+      category: null,
+      splitType: "equal" as const,
+      payers: [{ userId: "u1", amountCents: 500 }],
+      participantIds: ["u1"],
+    };
+    await api.addExpense(input);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe("http://localhost:8000/api/groups/g1/expenses");
+    expect(init!.method).toBe("POST");
+    expect(JSON.parse(init!.body as string)).toEqual(input);
   });
 });
