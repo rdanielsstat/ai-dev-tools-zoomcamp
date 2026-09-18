@@ -30,12 +30,19 @@ from database import (
     db_session,
     db_time,
     immediate_transaction,
+    is_sqlite,
     iso_time,
     recover_expired,
     recover_expired_in_session,
     utcnow,
 )
 from errors import RelayError
+
+
+def _get_task_locked(db: Session, task_id: str) -> Task | None:
+    if is_sqlite():
+        return db.get(Task, task_id)
+    return db.get(Task, task_id, with_for_update=True)
 
 
 def new_id(prefix: str) -> str:
@@ -78,7 +85,10 @@ def authenticate(token: str) -> Agent:
     # the same writer boundary as task operations so concurrent workers do not
     # hold stale WAL snapshots while trying to update it.
     with immediate_transaction() as db:
-        agent = db.scalar(select(Agent).where(Agent.token_hash == token_digest))
+        query = select(Agent).where(Agent.token_hash == token_digest)
+        if not is_sqlite():
+            query = query.with_for_update()
+        agent = db.scalar(query)
         if agent is None or not hmac.compare_digest(agent.token_hash, token_digest):
             raise RelayError("invalid_credentials", "The agent token is invalid.", 401)
         agent.last_seen_at = as_db_time(utcnow())
@@ -105,7 +115,13 @@ def list_agents(limit: int, cursor: tuple[datetime, str] | None) -> tuple[list[A
 
 def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
     # Serializing task creation makes the sender-scoped idempotency check and
-    # unique constraint one operation even when two API processes race.
+    # unique constraint one operation even when two API processes race. On
+    # SQLite this is airtight (BEGIN IMMEDIATE is a global writer lock). On
+    # PostgreSQL, two truly concurrent requests with the same brand-new key
+    # can both pass the "not found" check and one will hit the unique
+    # constraint on flush, surfacing as a 500 instead of returning the
+    # winner's task -- the client's own retry with the same key then
+    # succeeds normally. Not hit by this starter's tests.
     with immediate_transaction() as db:
         recipient = db.get(Agent, recipient_id)
         if recipient is None:
@@ -144,12 +160,17 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
-        task = db.scalar(
+        query = (
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
         )
+        if not is_sqlite():
+            # Skip rows another concurrent claimer already has locked instead
+            # of blocking behind them.
+            query = query.with_for_update(skip_locked=True)
+        task = db.scalar(query)
         if task is None:
             return None
         if task.attempt_count >= MAX_ATTEMPTS:
@@ -195,7 +216,7 @@ def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = _get_task_locked(db, task_id)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)
@@ -222,7 +243,7 @@ def commit_terminal(
     value: str,
 ) -> dict[str, str]:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = _get_task_locked(db, task_id)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)

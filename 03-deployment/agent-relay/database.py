@@ -134,6 +134,10 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+def is_sqlite() -> bool:
+    return _is_sqlite(DATABASE_URL)
+
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -177,19 +181,21 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    SQLite has no row-level locking, so a ``BEGIN IMMEDIATE`` writer
+    reservation serializes every claim, heartbeat, terminal submission, and
+    recovery pass across API processes -- one global writer at a time.
+    PostgreSQL instead locks only the specific rows an operation touches
+    (``SELECT ... FOR UPDATE`` / ``FOR UPDATE SKIP LOCKED`` in storage.py),
+    so independent agents' inboxes can make progress concurrently.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
@@ -205,16 +211,19 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    query = (
+        select(Attempt)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if not _is_sqlite(DATABASE_URL):
+        # Let concurrent recovery passes (e.g. multiple API replicas) skip
+        # rows another pass already has locked instead of blocking on them.
+        query = query.with_for_update(skip_locked=True)
+    expired = list(db.scalars(query))
     count = 0
     for attempt in expired:
-        task = db.get(Task, attempt.task_id)
+        task = db.get(Task, attempt.task_id) if _is_sqlite(DATABASE_URL) else db.get(Task, attempt.task_id, with_for_update=True)
         if task is None or attempt.outcome != "processing":
             continue
         attempt.outcome = "expired"
@@ -257,6 +266,7 @@ __all__ = [
     "engine",
     "immediate_transaction",
     "init_db",
+    "is_sqlite",
     "iso_time",
     "recover_expired",
     "recover_expired_in_session",
