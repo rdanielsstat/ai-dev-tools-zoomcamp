@@ -1,14 +1,14 @@
-import { createFileRoute, notFound } from "@tanstack/react-router";
+import { createFileRoute, notFound, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
 import { AppShell } from "@/components/AppShell";
-import { NewExpensePanel } from "@/components/NewExpensePanel";
+import { ExpenseForm, NewExpensePanel } from "@/components/NewExpensePanel";
 import { InkButton, Loading, Panel, QuietButton } from "@/components/ledger";
 import { api } from "@/lib/api";
 import { activityQuery, balancesQuery, expensesQuery, groupQuery, meQuery } from "@/lib/queries";
 import { SPLIT_TYPES, formatCents, formatSigned } from "@/lib/money";
-import type { Group } from "@/lib/types";
+import type { Expense, Group } from "@/lib/types";
 
 export const Route = createFileRoute("/groups/$groupId")({
   loader: async ({ params, context }) => {
@@ -19,7 +19,9 @@ export const Route = createFileRoute("/groups/$groupId")({
   head: ({ loaderData }) => {
     const name = loaderData?.group.name;
     if (!name) {
-      return { meta: [{ title: "Group unavailable — Even" }, { name: "robots", content: "noindex" }] };
+      return {
+        meta: [{ title: "Group unavailable — Even" }, { name: "robots", content: "noindex" }],
+      };
     }
     const title = `${name} — Even`;
     const description = `Balances, expenses and the smallest set of payments that clears ${name}.`;
@@ -54,10 +56,13 @@ function GroupDetail() {
   const { data: activity = [] } = useQuery(activityQuery(groupId));
   const [showRaw, setShowRaw] = useState(false);
   const [filterMember, setFilterMember] = useState("all");
+  const [filterCategory, setFilterCategory] = useState("all");
+  const [filterFrom, setFilterFrom] = useState("");
+  const [filterTo, setFilterTo] = useState("");
+  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
 
   const name = (userId: string) =>
-    group.members.find((m) => m.userId === userId)?.name ??
-    (userId === me?.id ? "You" : "member");
+    group.members.find((m) => m.userId === userId)?.name ?? (userId === me?.id ? "You" : "member");
 
   const myNet = me ? (balances?.net[me.id] ?? 0) : 0;
   const maxAbs = useMemo(
@@ -65,11 +70,20 @@ function GroupDetail() {
     [balances],
   );
 
+  const categories = useMemo(
+    () =>
+      Array.from(new Set(expenses.map((e) => e.category).filter((c): c is string => !!c))).sort(),
+    [expenses],
+  );
+
   const visibleExpenses = expenses.filter(
     (e) =>
-      filterMember === "all" ||
-      e.payers.some((p) => p.userId === filterMember) ||
-      Object.keys(e.shares).includes(filterMember),
+      (filterMember === "all" ||
+        e.payers.some((p) => p.userId === filterMember) ||
+        Object.keys(e.shares).includes(filterMember)) &&
+      (filterCategory === "all" || e.category === filterCategory) &&
+      (!filterFrom || e.date >= filterFrom) &&
+      (!filterTo || e.date <= filterTo),
   );
 
   return (
@@ -111,6 +125,10 @@ function GroupDetail() {
             Settle up
           </a>
           <InviteMember group={group} />
+          <LeaveGroup group={group} myUserId={me?.id} myNet={myNet} />
+          {me && group.members.find((m) => m.userId === me.id)?.role === "admin" ? (
+            <DeleteGroup group={group} />
+          ) : null}
         </div>
       </div>
 
@@ -196,40 +214,87 @@ function GroupDetail() {
           <Panel
             title="Expenses"
             aside={
-              <select
-                value={filterMember}
-                onChange={(e) => setFilterMember(e.target.value)}
-                className="num rounded-md bg-card px-2 py-1 text-[11px] text-ink2 ring-1 ring-black/5 outline-none"
-              >
-                <option value="all">all members</option>
-                {group.members.map((m) => (
-                  <option key={m.userId} value={m.userId}>
-                    {m.name}
-                  </option>
-                ))}
-              </select>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <select
+                  value={filterMember}
+                  onChange={(e) => setFilterMember(e.target.value)}
+                  className="num rounded-md bg-card px-2 py-1 text-[11px] text-ink2 ring-1 ring-black/5 outline-none"
+                >
+                  <option value="all">all members</option>
+                  {group.members.map((m) => (
+                    <option key={m.userId} value={m.userId}>
+                      {m.name}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={filterCategory}
+                  onChange={(e) => setFilterCategory(e.target.value)}
+                  className="num rounded-md bg-card px-2 py-1 text-[11px] text-ink2 ring-1 ring-black/5 outline-none"
+                >
+                  <option value="all">all categories</option>
+                  {categories.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="date"
+                  value={filterFrom}
+                  onChange={(e) => setFilterFrom(e.target.value)}
+                  className="num rounded-md bg-card px-2 py-1 text-[11px] text-ink2 ring-1 ring-black/5 outline-none"
+                />
+                <input
+                  type="date"
+                  value={filterTo}
+                  onChange={(e) => setFilterTo(e.target.value)}
+                  className="num rounded-md bg-card px-2 py-1 text-[11px] text-ink2 ring-1 ring-black/5 outline-none"
+                />
+              </div>
             }
           >
             <div className="divide-y divide-line/60">
               {visibleExpenses.length === 0 ? (
-                <p className="num px-5 py-6 text-[12px] text-ink3">No expenses yet.</p>
+                <p className="num px-5 py-6 text-[12px] text-ink3">
+                  No expenses match these filters.
+                </p>
               ) : (
-                visibleExpenses.map((e) => (
-                  <div key={e.id} className="flex items-center gap-3 px-5 py-3.5">
-                    <div className="min-w-0">
-                      <p className="truncate text-[13px] font-medium text-ink">{e.description}</p>
-                      <p className="num text-[11px] text-ink3">
-                        {e.date} · {SPLIT_TYPES.find((t) => t.id === e.splitType)?.label} ·{" "}
-                        {e.payers.map((p) => name(p.userId)).join(" + ")} paid
-                        {e.category ? ` · ${e.category}` : ""}
-                      </p>
+                visibleExpenses.map((e) =>
+                  editingExpenseId === e.id ? (
+                    <div key={e.id} className="border-b border-line/60 last:border-0">
+                      <ExpenseForm
+                        groupId={groupId}
+                        members={group.members}
+                        editing={e}
+                        onSaved={() => setEditingExpenseId(null)}
+                        onCancel={() => setEditingExpenseId(null)}
+                      />
                     </div>
-                    <span className="num ml-auto shrink-0 text-[14px] font-semibold text-ink">
-                      {formatCents(e.amountCents)}
-                    </span>
-                    <DeleteExpense expenseId={e.id} groupId={groupId} />
-                  </div>
-                ))
+                  ) : (
+                    <div key={e.id} className="flex items-center gap-3 px-5 py-3.5">
+                      <div className="min-w-0">
+                        <p className="truncate text-[13px] font-medium text-ink">{e.description}</p>
+                        <p className="num text-[11px] text-ink3">
+                          {e.date} · {SPLIT_TYPES.find((t) => t.id === e.splitType)?.label} ·{" "}
+                          {e.payers.map((p) => name(p.userId)).join(" + ")} paid
+                          {e.category ? ` · ${e.category}` : ""}
+                        </p>
+                      </div>
+                      <span className="num ml-auto shrink-0 text-[14px] font-semibold text-ink">
+                        {formatCents(e.amountCents)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setEditingExpenseId(e.id)}
+                        className="num ml-2 shrink-0 text-[11px] text-ink3 underline decoration-line hover:text-ink"
+                      >
+                        edit
+                      </button>
+                      <DeleteExpense expenseId={e.id} groupId={groupId} />
+                    </div>
+                  ),
+                )
               )}
             </div>
           </Panel>
@@ -413,6 +478,82 @@ function InviteMember({ group }: { group: Group }) {
       >
         Add
       </InkButton>
+    </div>
+  );
+}
+
+function LeaveGroup({
+  group,
+  myUserId,
+  myNet,
+}: {
+  group: Group;
+  myUserId: string | undefined;
+  myNet: number;
+}) {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const leave = useMutation({
+    mutationFn: () => api.leaveGroup(group.id),
+    onSuccess: async () => {
+      queryClient.removeQueries({ queryKey: ["group", group.id] });
+      await queryClient.invalidateQueries({ queryKey: ["groups"] });
+      navigate({ to: "/" });
+    },
+  });
+
+  if (!myUserId || !group.members.some((m) => m.userId === myUserId)) return null;
+  const canLeave = myNet === 0;
+
+  return (
+    <div className="flex items-center gap-2">
+      <QuietButton
+        disabled={!canLeave || leave.isPending}
+        onClick={() => leave.mutate()}
+        title={canLeave ? undefined : "Settle up before leaving this group."}
+      >
+        {leave.isPending ? "Leaving…" : "Leave group"}
+      </QuietButton>
+      {leave.isError ? (
+        <span className="num text-[11px] text-owe">{(leave.error as Error).message}</span>
+      ) : null}
+    </div>
+  );
+}
+
+function DeleteGroup({ group }: { group: Group }) {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const del = useMutation({
+    mutationFn: () => api.deleteGroup(group.id),
+    onSuccess: async () => {
+      queryClient.removeQueries({ queryKey: ["group", group.id] });
+      await queryClient.invalidateQueries({ queryKey: ["groups"] });
+      navigate({ to: "/" });
+    },
+  });
+
+  if (!confirming) {
+    return (
+      <QuietButton onClick={() => setConfirming(true)} className="text-owe">
+        Delete group
+      </QuietButton>
+    );
+  }
+  return (
+    <div className="flex items-center gap-2">
+      <span className="num text-[11px] text-ink3">Delete “{group.name}” for everyone?</span>
+      <InkButton className="py-2 text-[12px]" disabled={del.isPending} onClick={() => del.mutate()}>
+        {del.isPending ? "Deleting…" : "Confirm"}
+      </InkButton>
+      <QuietButton
+        className="py-2 text-[12px]"
+        disabled={del.isPending}
+        onClick={() => setConfirming(false)}
+      >
+        Cancel
+      </QuietButton>
     </div>
   );
 }

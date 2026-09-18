@@ -30,9 +30,7 @@ function GroupsOverview() {
   const { data: groups = [], isPending } = useQuery(groupsQuery);
   const balances = useQueries({ queries: groups.map((g) => balancesQuery(g.id)) });
 
-  const totalNet = me
-    ? balances.reduce((a, b) => a + (b.data?.net[me.id] ?? 0), 0)
-    : 0;
+  const totalNet = me ? balances.reduce((a, b) => a + (b.data?.net[me.id] ?? 0), 0) : 0;
 
   return (
     <AppShell>

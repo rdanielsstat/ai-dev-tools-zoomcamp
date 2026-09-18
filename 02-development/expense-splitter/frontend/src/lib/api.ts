@@ -17,55 +17,80 @@ import type {
 } from "./types";
 
 const LATENCY_MS = 260;
-const delay = <T>(value: T): Promise<T> =>
-  new Promise((resolve) => setTimeout(() => resolve(value), LATENCY_MS));
+
+/**
+ * Runs `fn` after a simulated network delay. `fn` is deferred (not invoked
+ * until the timeout fires) so a synchronous throw inside it — e.g. a
+ * validation error from the mock store — rejects the returned promise
+ * instead of throwing out of the caller, matching how a real fetch() call
+ * would fail.
+ */
+const delay = <T>(fn: () => T): Promise<T> =>
+  new Promise((resolve, reject) => {
+    setTimeout(() => {
+      try {
+        resolve(fn());
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    }, LATENCY_MS);
+  });
 
 export const api = {
   // ---- auth -------------------------------------------------------------
   /** GET /api/me */
-  getCurrentUser: (): Promise<User | null> => delay(db.currentUser()),
+  getCurrentUser: (): Promise<User | null> => delay(() => db.currentUser()),
   /** POST /api/auth/login */
-  signIn: (email: string, _password: string): Promise<User> => delay(db.signIn(email)),
+  signIn: (email: string, _password: string): Promise<User> => delay(() => db.signIn(email)),
   /** POST /api/auth/signup */
   signUp: (name: string, email: string, _password: string): Promise<User> =>
-    delay(db.signUp(name, email)),
+    delay(() => db.signUp(name, email)),
   /** POST /api/auth/logout */
-  signOut: (): Promise<void> => delay(db.signOut()),
+  signOut: (): Promise<void> => delay(() => db.signOut()),
   /** PATCH /api/me */
   updateProfile: (patch: { name?: string; email?: string }): Promise<User> =>
-    delay(db.updateProfile(patch)),
+    delay(() => db.updateProfile(patch)),
 
   // ---- groups -----------------------------------------------------------
   /** GET /api/groups */
-  listGroups: (): Promise<Group[]> => delay(db.groupsForCurrentUser()),
+  listGroups: (): Promise<Group[]> => delay(() => db.groupsForCurrentUser()),
   /** GET /api/groups/:id */
-  getGroup: (groupId: string): Promise<Group | null> => delay(db.group(groupId)),
+  getGroup: (groupId: string): Promise<Group | null> => delay(() => db.group(groupId)),
   /** POST /api/groups */
   createGroup: (name: string, description: string): Promise<Group> =>
-    delay(db.createGroup(name, description)),
+    delay(() => db.createGroup(name, description)),
   /** PATCH /api/groups/:id */
   renameGroup: (groupId: string, name: string): Promise<Group> =>
-    delay(db.renameGroup(groupId, name)),
+    delay(() => db.renameGroup(groupId, name)),
   /** POST /api/groups/:id/members */
-  addMember: (groupId: string, email: string): Promise<Group> => delay(db.addMember(groupId, email)),
+  addMember: (groupId: string, email: string): Promise<Group> =>
+    delay(() => db.addMember(groupId, email)),
+  /** POST /api/groups/:id/leave (400 if the current user's balance isn't zero) */
+  leaveGroup: (groupId: string): Promise<void> => delay(() => db.leaveGroup(groupId)),
+  /** DELETE /api/groups/:id (admin only) */
+  deleteGroup: (groupId: string): Promise<void> => delay(() => db.deleteGroup(groupId)),
 
   // ---- expenses ---------------------------------------------------------
   /** GET /api/groups/:id/expenses */
-  listExpenses: (groupId: string): Promise<Expense[]> => delay(db.expenses(groupId)),
+  listExpenses: (groupId: string): Promise<Expense[]> => delay(() => db.expenses(groupId)),
   /** POST /api/groups/:id/expenses */
-  addExpense: (input: NewExpenseInput): Promise<Expense> => delay(db.addExpense(input)),
+  addExpense: (input: NewExpenseInput): Promise<Expense> => delay(() => db.addExpense(input)),
+  /** PATCH /api/expenses/:id */
+  editExpense: (expenseId: string, input: NewExpenseInput): Promise<Expense> =>
+    delay(() => db.editExpense(expenseId, input)),
   /** DELETE /api/expenses/:id */
-  deleteExpense: (expenseId: string): Promise<void> => delay(db.deleteExpense(expenseId)),
+  deleteExpense: (expenseId: string): Promise<void> => delay(() => db.deleteExpense(expenseId)),
 
   // ---- balances & settlement -------------------------------------------
   /** GET /api/groups/:id/balances (server recomputes; mirrors src/lib/money.ts) */
-  getBalances: (groupId: string): Promise<GroupBalances> => delay(db.balances(groupId)),
+  getBalances: (groupId: string): Promise<GroupBalances> => delay(() => db.balances(groupId)),
   /** GET /api/groups/:id/payments */
-  listPayments: (groupId: string): Promise<Payment[]> => delay(db.payments(groupId)),
+  listPayments: (groupId: string): Promise<Payment[]> => delay(() => db.payments(groupId)),
   /** POST /api/groups/:id/payments */
-  recordPayment: (input: Omit<Payment, "id">): Promise<Payment> => delay(db.recordPayment(input)),
+  recordPayment: (input: Omit<Payment, "id">): Promise<Payment> =>
+    delay(() => db.recordPayment(input)),
 
   // ---- activity ---------------------------------------------------------
   /** GET /api/groups/:id/activity */
-  listActivity: (groupId: string): Promise<ActivityEvent[]> => delay(db.activity(groupId)),
+  listActivity: (groupId: string): Promise<ActivityEvent[]> => delay(() => db.activity(groupId)),
 };

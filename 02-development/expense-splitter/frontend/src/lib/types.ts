@@ -43,6 +43,8 @@ export interface Expense {
   /** userId -> cents owed for this expense. Always sums to amountCents. */
   shares: Record<string, number>;
   items?: ItemizedLine[] | undefined;
+  /** Raw per-participant input that produced `shares` (cents for exact, points for percent, weight for shares). Lets edit forms round-trip precisely. */
+  splitValues?: Record<string, number> | undefined;
   createdBy: string;
 }
 

@@ -62,7 +62,10 @@ const groups: Group[] = [
     description: "Monthly rotation",
     createdBy: "u_priya",
     createdAt: "2026-03-02",
-    members: [memberOf("u_priya", "admin", "2026-03-02"), memberOf("u_mara", "member", "2026-03-02")],
+    members: [
+      memberOf("u_priya", "admin", "2026-03-02"),
+      memberOf("u_mara", "member", "2026-03-02"),
+    ],
   },
 ];
 
@@ -86,6 +89,7 @@ function buildExpense(input: NewExpenseInput, createdBy: string): Expense {
     payers: input.payers,
     shares,
     items: input.items,
+    splitValues: input.values,
     createdBy,
   };
 }
@@ -253,7 +257,8 @@ export const db = {
   user: (userId: string) => users.find((u) => u.id === userId) ?? null,
   currentUser: () => (currentUserId ? (users.find((u) => u.id === currentUserId) ?? null) : null),
   signIn: (email: string) => {
-    const found = users.find((u) => u.email.toLowerCase() === email.trim().toLowerCase()) ?? users[0]!;
+    const found =
+      users.find((u) => u.email.toLowerCase() === email.trim().toLowerCase()) ?? users[0]!;
     currentUserId = found.id;
     return found;
   },
@@ -325,6 +330,35 @@ export const db = {
     }
     return group;
   },
+  leaveGroup: (groupId: string) => {
+    const uid = currentUserId!;
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) throw new Error("Group not found");
+    const member = group.members.find((m) => m.userId === uid);
+    if (!member) throw new Error("Not a member of this group");
+    const net = db.balances(groupId).net[uid] ?? 0;
+    if (net !== 0) throw new Error("Settle up before leaving this group.");
+    group.members = group.members.filter((m) => m.userId !== uid);
+    log({ groupId, kind: "member_left", actorUserId: uid, summary: "left the group" });
+  },
+  deleteGroup: (groupId: string) => {
+    const uid = currentUserId!;
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) throw new Error("Group not found");
+    const member = group.members.find((m) => m.userId === uid);
+    if (!member || member.role !== "admin") throw new Error("Only an admin can delete this group.");
+    const idx = groups.findIndex((g) => g.id === groupId);
+    groups.splice(idx, 1);
+    for (let i = expenses.length - 1; i >= 0; i -= 1) {
+      if (expenses[i]!.groupId === groupId) expenses.splice(i, 1);
+    }
+    for (let i = payments.length - 1; i >= 0; i -= 1) {
+      if (payments[i]!.groupId === groupId) payments.splice(i, 1);
+    }
+    for (let i = activity.length - 1; i >= 0; i -= 1) {
+      if (activity[i]!.groupId === groupId) activity.splice(i, 1);
+    }
+  },
 
   expenses: (groupId: string) =>
     [...expenses.filter((e) => e.groupId === groupId)].sort((a, b) => b.date.localeCompare(a.date)),
@@ -340,6 +374,22 @@ export const db = {
       amountCents: input.amountCents,
     });
     return expense;
+  },
+  editExpense: (expenseId: string, input: NewExpenseInput) => {
+    const idx = expenses.findIndex((e) => e.id === expenseId);
+    if (idx < 0) throw new Error("Expense not found");
+    const existing = expenses[idx]!;
+    const updated = buildExpense(input, existing.createdBy);
+    updated.id = existing.id;
+    expenses[idx] = updated;
+    log({
+      groupId: updated.groupId,
+      kind: "expense_edited",
+      actorUserId: currentUserId!,
+      summary: `edited ${updated.description}`,
+      amountCents: updated.amountCents,
+    });
+    return updated;
   },
   deleteExpense: (expenseId: string) => {
     const idx = expenses.findIndex((e) => e.id === expenseId);

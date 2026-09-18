@@ -1,0 +1,817 @@
+openapi: 3.0.3
+info:
+  title: Even — Expense Splitter API
+  description: >
+    REST API for the Even expense splitter. Derived from the frontend's
+    service layer (frontend/src/lib/api.ts) so the two stay in lock-step.
+    All money amounts are integer minor units (cents). All field names are
+    camelCase to match the frontend without a translation layer.
+  version: "1.0.0"
+servers:
+  - url: /api
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+  - name: groups
+  - name: expenses
+  - name: balances
+  - name: activity
+
+paths:
+  /auth/signup:
+    post:
+      tags: [auth]
+      summary: Create an account and sign in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignupRequest"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "409":
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in with email and password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          description: Invalid email or password
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Invalidate the current session token
+      responses:
+        "204":
+          description: Signed out
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /me:
+    get:
+      tags: [auth]
+      summary: Get the current user
+      responses:
+        "200":
+          description: The signed-in user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    patch:
+      tags: [auth]
+      summary: Update the current user's profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProfileRequest"
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Email already in use by another account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /groups:
+    get:
+      tags: [groups]
+      summary: List groups the current user belongs to
+      responses:
+        "200":
+          description: Groups
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Group"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [groups]
+      summary: Create a group (the caller becomes its admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateGroupRequest"
+      responses:
+        "201":
+          description: Created group
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Group"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /groups/{groupId}:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [groups]
+      summary: Get a group by id
+      responses:
+        "200":
+          description: The group
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Group"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [groups]
+      summary: Rename a group (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameGroupRequest"
+      responses:
+        "200":
+          description: Updated group
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Group"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [groups]
+      summary: Delete a group and all its expenses, payments, and activity (admin only)
+      responses:
+        "204":
+          description: Deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /groups/{groupId}/members:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    post:
+      tags: [groups]
+      summary: Add a member by email (creates the user if none exists)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddMemberRequest"
+      responses:
+        "200":
+          description: Updated group
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Group"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /groups/{groupId}/leave:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    post:
+      tags: [groups]
+      summary: Leave a group (only allowed when the caller's balance is zero)
+      responses:
+        "204":
+          description: Left the group
+        "400":
+          description: The caller's balance in this group isn't zero
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /groups/{groupId}/expenses:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [expenses]
+      summary: List a group's expenses, optionally filtered
+      parameters:
+        - name: memberId
+          in: query
+          schema:
+            type: string
+          description: Only expenses this member paid or shared in
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: dateFrom
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: dateTo
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Expenses, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Expense"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [expenses]
+      summary: Add an expense
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewExpenseInput"
+      responses:
+        "201":
+          description: Created expense
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Expense"
+        "400":
+          description: Split doesn't reconcile to the total, or payers don't sum to it
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /expenses/{expenseId}:
+    parameters:
+      - $ref: "#/components/parameters/ExpenseId"
+    patch:
+      tags: [expenses]
+      summary: Edit an expense
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewExpenseInput"
+      responses:
+        "200":
+          description: Updated expense
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Expense"
+        "400":
+          description: Split doesn't reconcile to the total, or payers don't sum to it
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [expenses]
+      summary: Delete an expense
+      responses:
+        "204":
+          description: Deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /groups/{groupId}/balances:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [balances]
+      summary: Net balances, raw pairwise IOUs, and the simplified settlement plan
+      responses:
+        "200":
+          description: Balances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GroupBalances"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /groups/{groupId}/payments:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [balances]
+      summary: List payments recorded in this group
+      responses:
+        "200":
+          description: Payments
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Payment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [balances]
+      summary: Record a payment between two members (settling up)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewPaymentInput"
+      responses:
+        "201":
+          description: Recorded payment
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /groups/{groupId}/activity:
+    parameters:
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      tags: [activity]
+      summary: Chronological activity feed for a group, newest first
+      responses:
+        "200":
+          description: Activity events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ActivityEvent"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Token returned by /auth/signup or /auth/login, sent as
+        `Authorization: Bearer <token>`. Every endpoint requires it except
+        /auth/signup and /auth/login.
+
+  parameters:
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      schema:
+        type: string
+    ExpenseId:
+      name: expenseId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Authenticated, but not allowed to perform this action
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: >
+        Not found, or the caller isn't a member of the group (membership is
+        never revealed to non-members)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+
+    User:
+      type: object
+      required: [id, name, email, avatarInitials]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        avatarInitials:
+          type: string
+
+    SignupRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    UpdateProfileRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+
+    AuthResponse:
+      type: object
+      required: [token, user]
+      properties:
+        token:
+          type: string
+        user:
+          $ref: "#/components/schemas/User"
+
+    Role:
+      type: string
+      enum: [admin, member]
+
+    Member:
+      type: object
+      required: [userId, name, avatarInitials, role, joinedAt]
+      properties:
+        userId:
+          type: string
+        name:
+          type: string
+        avatarInitials:
+          type: string
+        role:
+          $ref: "#/components/schemas/Role"
+        joinedAt:
+          type: string
+          format: date
+
+    Group:
+      type: object
+      required: [id, name, description, createdBy, createdAt, members]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/Member"
+
+    CreateGroupRequest:
+      type: object
+      required: [name, description]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+
+    RenameGroupRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+
+    AddMemberRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    SplitType:
+      type: string
+      enum: [equal, exact, percent, shares, itemized]
+
+    Payer:
+      type: object
+      required: [userId, amountCents]
+      properties:
+        userId:
+          type: string
+        amountCents:
+          type: integer
+
+    ItemizedLine:
+      type: object
+      required: [id, label, amountCents, participantIds]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        amountCents:
+          type: integer
+        participantIds:
+          type: array
+          items:
+            type: string
+
+    Expense:
+      type: object
+      required:
+        [id, groupId, description, amountCents, date, category, splitType, payers, shares, createdBy]
+      properties:
+        id:
+          type: string
+        groupId:
+          type: string
+        description:
+          type: string
+        amountCents:
+          type: integer
+        date:
+          type: string
+          format: date
+        category:
+          type: string
+          nullable: true
+        splitType:
+          $ref: "#/components/schemas/SplitType"
+        payers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Payer"
+        shares:
+          type: object
+          description: userId -> cents owed for this expense. Always sums to amountCents.
+          additionalProperties:
+            type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ItemizedLine"
+        splitValues:
+          type: object
+          description: >
+            Raw per-participant input that produced `shares` (cents for
+            exact, points for percent, weight for shares). Lets edit forms
+            round-trip precisely.
+          additionalProperties:
+            type: number
+        createdBy:
+          type: string
+
+    NewExpenseInput:
+      type: object
+      required: [groupId, description, amountCents, date, category, splitType, payers, participantIds]
+      properties:
+        groupId:
+          type: string
+        description:
+          type: string
+        amountCents:
+          type: integer
+        date:
+          type: string
+          format: date
+        category:
+          type: string
+          nullable: true
+        splitType:
+          $ref: "#/components/schemas/SplitType"
+        payers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Payer"
+        participantIds:
+          type: array
+          items:
+            type: string
+        values:
+          type: object
+          description: Per-participant exact cents / percent points / share weight, keyed by userId.
+          additionalProperties:
+            type: number
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ItemizedLine"
+        extraCents:
+          type: integer
+          description: Itemized only — tax + tip, distributed proportionally to item subtotals.
+
+    Payment:
+      type: object
+      required: [id, groupId, fromUserId, toUserId, amountCents, date]
+      properties:
+        id:
+          type: string
+        groupId:
+          type: string
+        fromUserId:
+          type: string
+        toUserId:
+          type: string
+        amountCents:
+          type: integer
+        date:
+          type: string
+          format: date
+        note:
+          type: string
+
+    NewPaymentInput:
+      type: object
+      required: [groupId, fromUserId, toUserId, amountCents, date]
+      properties:
+        groupId:
+          type: string
+        fromUserId:
+          type: string
+        toUserId:
+          type: string
+        amountCents:
+          type: integer
+        date:
+          type: string
+          format: date
+        note:
+          type: string
+
+    ActivityKind:
+      type: string
+      enum:
+        - expense_added
+        - expense_edited
+        - expense_deleted
+        - payment_recorded
+        - member_joined
+        - member_left
+        - group_created
+
+    ActivityEvent:
+      type: object
+      required: [id, groupId, kind, actorUserId, summary, at]
+      properties:
+        id:
+          type: string
+        groupId:
+          type: string
+        kind:
+          $ref: "#/components/schemas/ActivityKind"
+        actorUserId:
+          type: string
+        summary:
+          type: string
+        amountCents:
+          type: integer
+        at:
+          type: string
+          format: date-time
+
+    Transfer:
+      type: object
+      required: [fromUserId, toUserId, amountCents]
+      properties:
+        fromUserId:
+          type: string
+        toUserId:
+          type: string
+        amountCents:
+          type: integer
+
+    GroupBalances:
+      type: object
+      required: [net, pairwise, settlement]
+      properties:
+        net:
+          type: object
+          description: userId -> net cents (positive = owed money).
+          additionalProperties:
+            type: integer
+        pairwise:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transfer"
+        settlement:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transfer"

@@ -130,7 +130,8 @@ export function computeSplit(input: SplitInput): SplitResult {
     return {
       shares,
       totalAssigned: totalCents,
-      error: Math.abs(sum - 100) < 0.001 ? null : `Percentages must sum to 100% (currently ${sum}%).`,
+      error:
+        Math.abs(sum - 100) < 0.001 ? null : `Percentages must sum to 100% (currently ${sum}%).`,
     };
   }
 

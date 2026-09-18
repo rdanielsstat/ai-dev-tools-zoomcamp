@@ -63,7 +63,10 @@ export function Field({ label, children }: { label: string; children: ReactNode 
   );
 }
 
-export function TextInput({ className = "", ...rest }: React.InputHTMLAttributes<HTMLInputElement>) {
+export function TextInput({
+  className = "",
+  ...rest
+}: React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
       {...rest}
