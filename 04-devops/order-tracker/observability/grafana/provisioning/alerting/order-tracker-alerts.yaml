@@ -1,0 +1,57 @@
+# Templates use .Labels / .Values rather than $labels / $values: Grafana treats $ in
+# provisioning files as an environment variable.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: order-tracker
+    folder: Order Tracker
+    interval: 10s
+    rules:
+      - uid: order-tracker-5xx
+        title: Order Tracker 5xx responses
+        condition: C
+        data:
+          # 5xx responses per endpoint over the last 5 minutes.
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: >-
+                sum by (http_request_method, http_route) (
+                  increase(http_server_requests_total{job="order-tracker", http_response_status_code=~"5.."}[5m])
+                )
+              instant: true
+              range: false
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+        # No 5xx series yet (e.g. right after startup) means no server errors, not missing data.
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          service: order-tracker
+          severity: critical
+          endpoint: '{{ .Labels.http_request_method }} {{ .Labels.http_route }}'
+        annotations:
+          summary: '5xx responses on {{ .Labels.http_request_method }} {{ .Labels.http_route }}'
+          description: >-
+            About {{ printf "%.0f" .Values.A.Value }} 5xx responses on
+            {{ .Labels.http_request_method }} {{ .Labels.http_route }} in the last 5 minutes.
+          endpoint: '{{ .Labels.http_request_method }} {{ .Labels.http_route }}'
+          time_window: 5m
+          dashboard_url: '{{ externalURL }}d/order-tracker/order-tracker?from=now-30m&to=now'
+          # Links the alert to the dashboard's "Error rate by route and status" panel.
+          __dashboardUid__: order-tracker
+          __panelId__: "6"

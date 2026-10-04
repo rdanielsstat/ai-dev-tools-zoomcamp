@@ -35,6 +35,8 @@ The app sends OpenTelemetry metrics, logs, and traces over OTLP to an OpenTeleme
 
 Override the ports with `GRAFANA_PORT`, `PROMETHEUS_PORT`, `LOKI_PORT`, and `TEMPO_PORT`. The request counter is `http_server_requests_total` in Prometheus, labelled with `http_route` and `http_response_status_code`. In Grafana, a log line links to its trace, and a span links back to its logs. Tempo search leaves out the last 30 seconds, so a brand-new trace takes a moment to show up.
 
+The Grafana alert rule **Order Tracker 5xx responses** (folder *Order Tracker*, provisioned from `observability/grafana/provisioning/alerting/`) checks every 10 seconds for 5xx responses per endpoint over the last 5 minutes. It fires as soon as one appears and returns to Normal once 5 minutes pass without any. "No data" (no 5xx has happened yet) counts as Normal. Each alert has the endpoint, time window, and a dashboard link. No contact point is set up yet.
+
 Without `OTEL_EXPORTER_OTLP_ENDPOINT` (for example when running `uvicorn` locally), the app prints telemetry to the console instead.
 
 ## API
