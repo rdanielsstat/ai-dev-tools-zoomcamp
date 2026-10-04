@@ -1,0 +1,22 @@
+# Sends every alert to the incident responder (incident-response/), which runs on the host.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: incident-responder
+    receivers:
+      - uid: incident-responder-webhook
+        type: webhook
+        settings:
+          url: $RESPONDER_WEBHOOK_URL
+          httpMethod: POST
+        disableResolveMessage: false
+
+policies:
+  - orgId: 1
+    receiver: incident-responder
+    # One notification per alert and endpoint, so each incident gets its own investigation.
+    group_by: [alertname, endpoint]
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 4h

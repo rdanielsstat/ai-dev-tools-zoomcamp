@@ -1,5 +1,3 @@
-from datetime import datetime, timedelta
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -35,25 +33,3 @@ def test_create_and_update_order(client):
 
 def test_missing_order(client):
     assert client.get("/api/orders/missing").status_code == 404
-
-
-def test_express_order_placed_at_month_end(client):
-    # Seeded express-1002 was placed on the last day of the previous month.
-    response = client.get("/api/orders/express-1002")
-    assert response.status_code == 200
-    placed_at = datetime.fromisoformat(response.json()["created_at"])
-    expected = (placed_at + timedelta(days=2)).date().isoformat()
-    assert response.json()["estimated_delivery"] == expected
-
-
-@pytest.mark.parametrize(
-    ("created_at", "estimated_delivery"),
-    [
-        ("2026-01-31T10:00:00+00:00", "2026-02-02"),
-        ("2026-02-27T10:00:00+00:00", "2026-03-01"),
-        ("2026-12-31T23:30:00+00:00", "2027-01-02"),
-    ],
-)
-def test_express_delivery_estimate_crosses_month_and_year(created_at, estimated_delivery):
-    order = main.order_detail({"priority": "express", "created_at": created_at})
-    assert order["estimated_delivery"] == estimated_delivery

@@ -13,7 +13,7 @@ cd incident-response
 uv run --frozen python responder.py
 ```
 
-It listens on `127.0.0.1:8001`. Grafana in Docker can reach it at `http://host.docker.internal:8001/alerts`.
+It listens on `127.0.0.1:8001`. Grafana's *incident-responder* contact point sends every alert to `http://host.docker.internal:8001/alerts`. Alerts are grouped by alert name and endpoint, sent about 10 seconds after they start firing, and repeated every 4 hours while they keep firing.
 
 ## What happens on an alert
 
