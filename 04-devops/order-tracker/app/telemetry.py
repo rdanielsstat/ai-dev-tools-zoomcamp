@@ -4,16 +4,26 @@ import os
 from opentelemetry import metrics, trace
 from opentelemetry._logs import SeverityNumber, get_logger, set_logger_provider
 from opentelemetry.sdk._logs import LoggerProvider
-from opentelemetry.sdk._logs.export import ConsoleLogRecordExporter, SimpleLogRecordProcessor
+from opentelemetry.sdk._logs.export import (
+    BatchLogRecordProcessor,
+    ConsoleLogRecordExporter,
+    SimpleLogRecordProcessor,
+)
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    ConsoleSpanExporter,
+    SimpleSpanProcessor,
+)
 
 
 SERVICE_NAME = "order-tracker"
 METRIC_EXPORT_INTERVAL_MS = int(os.getenv("OTEL_METRIC_EXPORT_INTERVAL", "5000"))
+# Set to the Collector (e.g. http://otel-collector:4318) to export over OTLP; unset means console.
+OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 SEVERITIES = {
     logging.DEBUG: SeverityNumber.DEBUG,
     logging.INFO: SeverityNumber.INFO,
@@ -48,21 +58,45 @@ class OTelHandler(logging.Handler):
         )
 
 
+def otlp_pipeline():
+    """Batch everything to the Collector over OTLP/HTTP; the exporters read OTEL_EXPORTER_OTLP_*."""
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    return (
+        BatchSpanProcessor(OTLPSpanExporter()),
+        OTLPMetricExporter(),
+        BatchLogRecordProcessor(OTLPLogExporter()),
+    )
+
+
+def console_pipeline():
+    """Print everything to stdout so `docker compose logs app` shows it."""
+    return (
+        SimpleSpanProcessor(ConsoleSpanExporter()),
+        ConsoleMetricExporter(),
+        SimpleLogRecordProcessor(ConsoleLogRecordExporter()),
+    )
+
+
 def setup_telemetry():
-    """Export traces, metrics, and logs to stdout so `docker compose logs app` shows them."""
     resource = Resource.create({"service.name": SERVICE_NAME})
+    span_processor, metric_exporter, log_processor = (
+        otlp_pipeline() if OTLP_ENDPOINT else console_pipeline()
+    )
 
     tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+    tracer_provider.add_span_processor(span_processor)
     trace.set_tracer_provider(tracer_provider)
 
     reader = PeriodicExportingMetricReader(
-        ConsoleMetricExporter(), export_interval_millis=METRIC_EXPORT_INTERVAL_MS
+        metric_exporter, export_interval_millis=METRIC_EXPORT_INTERVAL_MS
     )
     metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[reader]))
 
     logger_provider = LoggerProvider(resource=resource)
-    logger_provider.add_log_record_processor(SimpleLogRecordProcessor(ConsoleLogRecordExporter()))
+    logger_provider.add_log_record_processor(log_processor)
     set_logger_provider(logger_provider)
 
     app_logger = logging.getLogger("order_tracker")
@@ -80,9 +114,4 @@ request_counter = meter.create_counter(
     "http.server.requests",
     unit="{request}",
     description="HTTP requests handled, by route and status code",
-)
-request_duration = meter.create_histogram(
-    "http.server.request.duration",
-    unit="s",
-    description="HTTP request duration, by route and status code",
-)
+)# FastAPI already records http.server.request.duration and a server span per request.

@@ -1,0 +1,17 @@
+# Metrics arrive from the Collector through the OTLP receiver, not by scraping the app.
+global:
+  scrape_interval: 15s
+
+otlp:
+  # Keep OTel names readable in PromQL: http.server.requests -> http_server_requests_total.
+  translation_strategy: UnderscoreEscapingWithSuffixes
+
+storage:
+  tsdb:
+    # Batched OTLP pushes can arrive slightly out of order.
+    out_of_order_time_window: 30m
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

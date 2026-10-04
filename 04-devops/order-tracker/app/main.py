@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,7 +10,7 @@ from fastapi.responses import FileResponse
 from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, Field
 
-from app.telemetry import logger, request_counter, request_duration, tracer
+from app.telemetry import logger, request_counter, tracer
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
@@ -80,12 +79,12 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Order Tracker", lifespan=lifespan)
+# app.telemetry already wires the OTLP exporters; FastAPI adding its own would export everything twice.
+app = FastAPI(title="Order Tracker", lifespan=lifespan, telemetry={"auto_configure": False})
 
 
 @app.middleware("http")
 async def record_request_metrics(request: Request, call_next):
-    start = time.perf_counter()
     status_code = 500
     try:
         response = await call_next(request)
@@ -99,7 +98,6 @@ async def record_request_metrics(request: Request, call_next):
             "http.response.status_code": status_code,
         }
         request_counter.add(1, attributes)
-        request_duration.record(time.perf_counter() - start, attributes)
 
 
 @app.get("/")
@@ -123,7 +121,13 @@ def list_orders():
 
 @app.get("/api/orders/{order_id}")
 def get_order(order_id: str):
-    with tracer.start_as_current_span("order.lookup", attributes={"order.id": order_id}) as span:
+    # A missing order is a normal 404, so only real failures mark the span as an error.
+    with tracer.start_as_current_span(
+        "order.lookup",
+        attributes={"order.id": order_id},
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
         with connect() as db:
             row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
         if row is None:
